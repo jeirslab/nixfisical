@@ -1,9 +1,13 @@
 # Secret syncs: push what is in Infisical out to 49 other places.
 #
-# This is the direction nixfisical does not currently go at all. Today the
-# tool pushes SOPS into Infisical and stops. A sync is Infisical pushing
-# onward — into AWS Parameter Store, into GitHub Actions secrets, into a
-# Vercel project — on its own schedule, without us in the loop.
+# This direction is implemented: `nixfisical syncs` (see README, "Secrets
+# Infisical pushes onward") converges a list built with `lib.mkSync` /
+# `lib.mkGithubSync`, resolving `project` and `connection` by name. The
+# nested `instances.<i>.projects.<p>.syncs` shape below is still the
+# scaffold for the eventual configuration module; today the list is flat
+# and `project` is a field. A sync is Infisical pushing onward — into AWS
+# Parameter Store, into GitHub Actions secrets, into a Vercel project — on
+# its own schedule, without us in the loop.
 #
 # The asymmetry worth noticing: everything in 40-secrets.nix runs when we run
 # the reconciler. A sync runs when Infisical decides, which means the state of

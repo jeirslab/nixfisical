@@ -89,20 +89,28 @@
       # `extraSecrets` is a list of `lib.mkExportOnly` results: secrets to
       # export that no host declares. See the comment on `mkExportOnly` for
       # when that is the honest thing to do rather than a shortcut.
-      mkManifestApp = { pkgs, nixosConfigurations, extraSecrets ? [ ], validate ? true }:
+      mkManifestApp = { pkgs, nixosConfigurations, extraSecrets ? [ ], syncs ? [ ], validate ? true }:
         let
           raw = nixfisicalLib.manifestFrom { inherit nixosConfigurations extraSecrets; };
           manifest = if validate then nixfisicalLib.assertManifest raw else raw;
           json = builtins.toJSON manifest;
+          # The outbound half (`nixfisical syncs`): a second, smaller manifest
+          # rather than a second kind of entry in the first, so every existing
+          # consumer of the secrets manifest keeps reading a list of secrets.
+          syncsJson = builtins.toJSON (if validate then nixfisicalLib.assertSyncs syncs else syncs);
         in
         pkgs.writeShellApplication {
           name = "infisical-manifest";
           runtimeInputs = [ pkgs.jq pkgs.util-linux ];
           text = ''
             M=${pkgs.lib.escapeShellArg json}
+            S=${pkgs.lib.escapeShellArg syncsJson}
             case "''${1:-json}" in
               json)
                 printf '%s' "$M" | jq '.'
+                ;;
+              syncs)
+                printf '%s' "$S" | jq '.'
                 ;;
               table)
                 {
@@ -116,7 +124,7 @@
                 echo "exported secrets: $(printf '%s' "$M" | jq 'length')"
                 ;;
               *)
-                echo "usage: infisical-manifest [json|table]" >&2
+                echo "usage: infisical-manifest [json|table|syncs]" >&2
                 exit 1
                 ;;
             esac
@@ -175,6 +183,7 @@
           # They are pruned like any other entry: drop one here and the next
           # sync deletes it from Infisical.
         , extraSecrets ? [ ]
+        , syncs ? [ ]
         , validate ? true
         , adminFile ? "secrets/infisical-admin.yaml"
           # The age identity to decrypt with, if SOPS_AGE_KEY_FILE is not
@@ -232,7 +241,7 @@
         }:
         let
           manifestApp = self.mkManifestApp {
-            inherit pkgs nixosConfigurations extraSecrets validate;
+            inherit pkgs nixosConfigurations extraSecrets syncs validate;
           };
           inherit (pkgs) lib;
           # An operator entry -> the `EMAIL[:ROLE]` string the CLI parses.
@@ -315,6 +324,16 @@
               --admin-file ${pkgs.lib.escapeShellArg adminFile} \
               sync --manifest "$manifest" "$@"
             echo ""
+            ${pkgs.lib.optionalString (syncs != [ ]) ''
+            # Outbound syncs, after the projects they live in exist.
+            syncs_manifest=$(mktemp)
+            trap 'rm -f "$manifest" "$syncs_manifest"' EXIT
+            infisical-manifest syncs > "$syncs_manifest"
+            nixfisical --url ${pkgs.lib.escapeShellArg url} \
+              --admin-file ${pkgs.lib.escapeShellArg adminFile} \
+              syncs --manifest "$syncs_manifest" "$@"
+            echo ""
+            ''}
             nixfisical --url ${pkgs.lib.escapeShellArg url} \
               --admin-file ${pkgs.lib.escapeShellArg adminFile} \
               sync-access --manifest "$manifest"${accessArgs} "$@"

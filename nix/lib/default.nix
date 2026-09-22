@@ -253,6 +253,92 @@ rec {
   # confusing HTTP 4xx halfway through a sync. Cheap to run at `nix flake
   # check` time; `nixfisical validate` repeats these against the rendered
   # JSON for anyone consuming the manifest outside Nix.
+  # -- secret syncs ---------------------------------------------------------
+  #
+  # A sync is Infisical pushing one folder of one environment onward, on its
+  # own schedule. Entries use the API's own field names (see
+  # examples/60-syncs.nix); `project` and `connection` are NAMES the
+  # reconciler resolves to ids. `nixfisical syncs` converges them, after
+  # `sync` has created the projects they live in.
+  mkSync =
+    { name
+    , project
+    , destination
+    , connection
+    , environment ? "prod"
+    , secretPath ? "/"
+    , description ? null
+    , isAutoSyncEnabled ? true
+    , syncOptions ? { }
+    , destinationConfig ? { }
+    , app ? null              # app-connection kind when it differs from `destination`
+    }: {
+      inherit name project destination connection environment secretPath
+        isAutoSyncEnabled syncOptions destinationConfig;
+    } // lib.optionalAttrs (description != null) { inherit description; }
+      // lib.optionalAttrs (app != null) { inherit app; };
+
+  # GitHub Actions secrets of one repository. `overwrite-destination` is the
+  # only initialSyncBehavior GitHub accepts (there is no API to read Actions
+  # secrets back), so it is not a parameter.
+  mkGithubSync =
+    { owner
+    , repo
+    , project
+    , connection
+    , name ? "${owner}/${repo}"
+    , environment ? "prod"
+    , secretPath ? "/"
+    , keySchema ? "{{secretKey}}"
+    , disableSecretDeletion ? false
+    , isAutoSyncEnabled ? true
+    , description ? null
+    }:
+    mkSync {
+      inherit name project connection environment secretPath isAutoSyncEnabled description;
+      destination = "github";
+      syncOptions = {
+        initialSyncBehavior = "overwrite-destination";
+        inherit keySchema disableSecretDeletion;
+      };
+      destinationConfig = { scope = "repository"; inherit owner repo; };
+    };
+
+  assertSyncs = syncs:
+    let
+      missing = field: lib.filter (e: !(e ? ${field}) || e.${field} == "" || e.${field} == null) syncs;
+      badPath = lib.filter (e: !(lib.hasPrefix "/" (e.secretPath or "/"))) syncs;
+      badEnv = lib.filter
+        (e: builtins.match "[a-z0-9-]+" (e.environment or "") == null)
+        syncs;
+      noBehaviour = lib.filter
+        (e: !((e.syncOptions or { }) ? initialSyncBehavior))
+        syncs;
+      coordinate = e: "${e.project or "?"}:${e.name or "?"}";
+      dup =
+        let
+          counts = lib.foldl'
+            (acc: e: acc // { ${coordinate e} = (acc.${coordinate e} or 0) + 1; })
+            { }
+            syncs;
+        in
+        lib.filter (e: counts.${coordinate e} > 1) syncs;
+      err = msg: entries:
+        lib.optional (entries != [ ])
+          "${msg}: ${lib.concatMapStringsSep ", " coordinate entries}";
+      problems =
+        err "sync without a name" (missing "name")
+        ++ err "sync without a project" (missing "project")
+        ++ err "sync without a destination" (missing "destination")
+        ++ err "sync without a connection" (missing "connection")
+        ++ err "secretPath must start with /" badPath
+        ++ err "environment must be a slug" badEnv
+        ++ err "syncOptions.initialSyncBehavior is required" noBehaviour
+        ++ err "sync declared twice" dup;
+    in
+    if problems == [ ] then syncs
+    else throw ("nixfisical: invalid syncs declaration:\n  " + lib.concatStringsSep "\n  " problems);
+
   assertManifest = manifest:
     let
       missingFile = lib.filter (e: e.sopsFile == null) manifest;
