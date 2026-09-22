@@ -204,6 +204,16 @@ def test_missing_project_is_an_error_and_never_created_here() -> None:
     assert summary.errors and "does not exist" in summary.errors[0]
 
 
+def test_dry_run_reports_a_sync_whose_project_sync_would_create_as_pending() -> None:
+    """`infisical-sync --dry-run` runs `sync --dry-run` (which plans the project) and
+    then `syncs --dry-run`. The project does not exist between the two, and that
+    must not read as an error: the real run creates it first."""
+    client = FakeClient(PROJECTS, CONNECTIONS)
+    summary = reconcile_syncs(client, [github(project="ghost")], organization_id=ORG, dry_run=True)
+    assert summary.ok and summary.created == 1
+    assert any(a.result == "would-create" and "ghost" in a.detail for a in summary.actions)
+
+
 def test_a_changed_destination_is_refused_not_patched() -> None:
     entry = github()
     client = FakeClient(PROJECTS, CONNECTIONS, {"org-engine": [live(entry, destination="gitlab")]})

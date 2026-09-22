@@ -304,6 +304,14 @@ def reconcile_syncs(
         project = str(entry["project"])
         project_id = projects.get(project)
         if not project_id:
+            if dry_run:
+                # The sync app runs `sync --dry-run` before this, and that run
+                # plans the project without creating it. A real run has it by
+                # now; report the sync as pending on it rather than failing a
+                # dry run for a state the dry run itself cannot produce.
+                summary.created += 1
+                summary.record(target, "would-create", f"once 'sync' has created project {project!r}")
+                continue
             summary.fail(target, f"project {project!r} does not exist (run 'nixfisical sync' first)")
             continue
         cid = connection_id(entry)
