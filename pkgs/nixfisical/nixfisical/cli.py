@@ -112,6 +112,7 @@ from nixfisical.provision import HostCredentials
 from nixfisical.provision import provision_host as run_provision_host
 from nixfisical.pull import pull as run_pull
 from nixfisical.reconcile import reconcile as run_reconcile
+from nixfisical.reconcile import validate_projects
 from nixfisical.sops import SopsError, extract, sops_key_expr
 from nixfisical.syncs import reconcile_syncs as run_reconcile_syncs
 from nixfisical.syncs import validate_syncs
@@ -129,6 +130,28 @@ def _fail(message: str, code: int = EXIT_RUNTIME) -> None:
     """Print an error to stderr and exit with the contractual code."""
     click.secho(f"error: {message}", fg="red", err=True)
     sys.exit(code)
+
+
+def _load_projects(source: str) -> dict[str, Any]:
+    """Read the projects file (a JSON object), or stdin when ``source`` is ``-``."""
+    import json
+
+    if source == "-":
+        raw = sys.stdin.read()
+        origin = "<stdin>"
+    else:
+        path = Path(source)
+        if not path.is_file():
+            raise ValueError(f"projects file not found: {path}")
+        raw = path.read_text(encoding="utf-8")
+        origin = str(path)
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"projects file {origin} is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"projects file {origin} must be a JSON object keyed by project name")
+    return document
 
 
 def _read_sops_ref(spec: str, secrets_file: Path | None, *, what: str) -> str:
@@ -746,6 +769,23 @@ def add_org_command(
     help="Read everything, write nothing, and report exactly what would change "
     "-- including which secrets would be deleted.",
 )
+@click.option(
+    "--prune-environments",
+    is_flag=True,
+    default=False,
+    help="Also delete environments the manifest does not declare, in projects "
+    "it does -- but only EMPTY ones. A non-empty undeclared environment is "
+    "reported and kept. New projects are created without Infisical's default "
+    "environments regardless of this flag.",
+)
+@click.option(
+    "--projects",
+    "projects_source",
+    default=None,
+    help="JSON object of per-project metadata keyed by project name "
+    "(`infisical-manifest projects`): {\"name\": {\"description\": \"...\"}}. "
+    "Applied on create and reconciled on every run.",
+)
 @click.pass_context
 def sync_command(
     ctx: click.Context,
@@ -754,6 +794,8 @@ def sync_command(
     root: Path,
     no_prune: bool,
     dry_run: bool,
+    prune_environments: bool,
+    projects_source: str | None,
 ) -> None:
     """Converge the instance onto the manifest.
 
@@ -767,6 +809,20 @@ def sync_command(
     except ValueError as exc:
         _fail(str(exc), EXIT_VALIDATION)
         return
+
+    projects: dict[str, Any] = {}
+    if projects_source is not None:
+        try:
+            projects = _load_projects(projects_source)
+        except ValueError as exc:
+            _fail(str(exc), EXIT_VALIDATION)
+            return
+        project_problems = validate_projects(projects)
+        if project_problems:
+            click.secho(f"projects file has {len(project_problems)} problem(s):", fg="red", err=True)
+            for problem in project_problems:
+                click.echo(f"  - {problem}", err=True)
+            sys.exit(EXIT_VALIDATION)
 
     problems = validate_manifest(manifest, default_secrets_file=secrets_file)
     if problems:
@@ -794,6 +850,8 @@ def sync_command(
             organization_id=organization_id,
             prune=not no_prune,
             dry_run=dry_run,
+            prune_environments=prune_environments,
+            projects=projects,
         )
 
     for action in summary.actions:

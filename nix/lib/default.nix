@@ -386,6 +386,23 @@ rec {
     if problems == [ ] then syncs
     else throw ("nixfisical: invalid syncs declaration:\n  " + lib.concatStringsSep "\n  " problems);
 
+  # Per-project metadata for `sync --projects`: `{ <name> = { description =
+  # "…"; }; }`. Checked here so a typo'd field or an over-long description
+  # fails at `nix flake check` rather than as a 400 halfway through a sync.
+  assertProjects = projects:
+    let
+      bad = lib.filterAttrs
+        (name: meta:
+          !(builtins.isAttrs meta)
+          || (lib.any (k: k != "description") (builtins.attrNames meta))
+          || ((meta.description or "") != null && !(builtins.isString (meta.description or "")))
+          || (builtins.stringLength (meta.description or "") > 1024))
+        projects;
+    in
+    if bad == { } then projects
+    else throw ("nixfisical: invalid projects declaration (only `description`, a string of at most 1024 chars): "
+      + lib.concatStringsSep ", " (builtins.attrNames bad));
+
   assertManifest = manifest:
     let
       isLiteral = e: (e.source or "sops") == "literal";

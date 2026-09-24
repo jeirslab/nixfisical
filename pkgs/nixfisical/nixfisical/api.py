@@ -571,18 +571,74 @@ class InfisicalClient:
             if workspace.get("name") and workspace.get("id")
         }
 
-    def create_project(self, name: str) -> str:
-        """Create a secret-manager project; return its id."""
+    def create_project(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        create_default_envs: bool = False,
+    ) -> str:
+        """Create a secret-manager project; return its id.
+
+        ``create_default_envs`` is off: Infisical would otherwise seed every
+        new project with Development/Staging/Production, and the declaration
+        is what says which environments exist -- ``reconcile`` creates the
+        declared ones a step later. A project seeded with three environments
+        nobody declared is three things the operator has to delete by hand,
+        and (until ``--prune-environments``) nothing here would.
+        """
+        body: dict[str, Any] = {
+            "projectName": name,
+            "type": "secret-manager",
+            "shouldCreateDefaultEnvs": create_default_envs,
+        }
+        if description:
+            body["projectDescription"] = description
         _, payload = self._request(
             "POST",
             "/api/v2/workspace",
-            json={"projectName": name, "type": "secret-manager"},
+            json=body,
             description=f"create project {name!r}",
         )
         project_id = payload.get("project", {}).get("id")
         if not project_id:
             raise InfisicalError(f"create project {name!r} returned no project id")
         return project_id
+
+    def get_project(self, project_id: str) -> dict[str, Any]:
+        """The project as the API describes it: name, description, environments.
+
+        ``environments`` is a list of ``{id, name, slug}``; the id is what the
+        delete endpoint wants, the slug is what the manifest declares.
+        """
+        _, payload = self._request(
+            "GET",
+            f"/api/v1/workspace/{project_id}",
+            description="get project",
+        )
+        project = payload.get("workspace")
+        return project if isinstance(project, dict) else payload
+
+    def update_project(self, project_id: str, *, description: str) -> None:
+        """``PATCH`` the project's description (the API caps it at 1024 chars)."""
+        self._request(
+            "PATCH",
+            f"/api/v1/workspace/{project_id}",
+            json={"description": description},
+            description="update project description",
+        )
+
+    def delete_environment(self, project_id: str, environment_id: str) -> None:
+        """Delete an environment by id. Everything in it goes with it.
+
+        The caller is expected to have established that it is empty;
+        ``reconcile`` does, and refuses otherwise.
+        """
+        self._request(
+            "DELETE",
+            f"/api/v1/workspace/{project_id}/environments/{environment_id}",
+            description=f"delete environment {environment_id}",
+        )
 
     def create_environment(self, project_id: str, *, name: str, slug: str) -> bool:
         """Ensure an environment exists. Returns True if we created it.
