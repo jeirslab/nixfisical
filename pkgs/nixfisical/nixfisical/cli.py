@@ -106,6 +106,8 @@ from nixfisical.provision import provision_host as run_provision_host
 from nixfisical.pull import pull as run_pull
 from nixfisical.reconcile import reconcile as run_reconcile
 from nixfisical.sops import SopsError, extract, sops_key_expr
+from nixfisical.syncs import reconcile_syncs as run_reconcile_syncs
+from nixfisical.syncs import validate_syncs
 from nixfisical import keyring as keyring_ops
 from nixfisical import store as store_ops
 
@@ -801,6 +803,98 @@ def sync_command(
     legend = summary.legend()
     if legend:
         click.secho(legend, fg="yellow")
+    if not summary.ok:
+        sys.exit(EXIT_RUNTIME)
+
+
+# --------------------------------------------------------------------------
+# syncs
+# --------------------------------------------------------------------------
+
+
+@cli.command("syncs")
+@click.option(
+    "--manifest",
+    "manifest_source",
+    default="-",
+    show_default=True,
+    help="Path to the JSON syncs manifest (`infisical-manifest syncs`), or '-' for stdin.",
+)
+@click.option(
+    "--no-prune",
+    is_flag=True,
+    default=False,
+    help="Leave undeclared syncs in declared projects in place.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Read projects, syncs and connections; write nothing; report what would change.",
+)
+@click.option(
+    "--run",
+    "trigger",
+    is_flag=True,
+    default=False,
+    help="After converging, trigger every declared sync (the first push, or a forced re-push).",
+)
+@click.pass_context
+def syncs_command(
+    ctx: click.Context,
+    manifest_source: str,
+    no_prune: bool,
+    dry_run: bool,
+    trigger: bool,
+) -> None:
+    """Converge the instance's secret syncs onto the syncs manifest.
+
+    Runs after ``sync``: a sync lives in a project, and ``sync`` is what
+    creates projects. Connections are resolved by name and never created --
+    authorising one is a browser round-trip with the provider. Pruning never
+    removes what a sync already wrote downstream.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+
+    try:
+        manifest = load_manifest(manifest_source)
+    except ValueError as exc:
+        _fail(str(exc), EXIT_VALIDATION)
+        return
+
+    problems = validate_syncs(manifest)
+    if problems:
+        click.secho(f"syncs manifest has {len(problems)} problem(s):", fg="red", err=True)
+        for problem in problems:
+            click.echo(f"  - {problem}", err=True)
+        sys.exit(EXIT_VALIDATION)
+
+    with _client(ctx) as client:
+        try:
+            organization_id = read_organization_id(admin_file)
+            client.universal_auth_login(read_sync_credentials(admin_file))
+        except (SopsError, InfisicalError) as exc:
+            _fail(
+                f"could not authenticate with {admin_file}: {exc}. "
+                "Run 'nixfisical status' to check the instance, or bootstrap it first."
+            )
+            return
+
+        summary = run_reconcile_syncs(
+            client,
+            manifest,
+            organization_id=organization_id,
+            prune=not no_prune,
+            dry_run=dry_run,
+            run=trigger,
+        )
+
+    for action in summary.actions:
+        click.echo(f"  {action.render()}")
+    click.secho(
+        ("DRY RUN " if dry_run else "") + summary.headline(),
+        fg="yellow" if dry_run else ("green" if summary.ok else "red"),
+    )
     if not summary.ok:
         sys.exit(EXIT_RUNTIME)
 

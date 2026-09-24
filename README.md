@@ -203,6 +203,63 @@ because they can fail for unrelated reasons — the instance being unreachable
 versus a SOPS file you cannot decrypt — and folding them together would mean
 one exit code answering two questions.
 
+### Secrets Infisical pushes onward
+
+A **secret sync** is the other direction: Infisical pushing one folder of one
+environment into somewhere else -- GitHub Actions secrets, Parameter Store,
+another Infisical -- on its own schedule, with no host and no operator in the
+loop. Declare them next to the secrets they push, in the API's own field
+names, and hand the list to the sync app:
+
+```nix
+infisical-sync = nixfisical.mkSyncApp {
+  inherit pkgs;
+  inherit (self) nixosConfigurations;
+  url = "https://infisical.example.com";
+  # The App key the org engine mints tokens with: no host holds it, so it
+  # is export-only, and it lives in its own project.
+  extraSecrets = [
+    (nixfisical.lib.mkExportOnly {
+      sopsFile = ./secrets/org-engine.yaml; sopsKey = "github_app/private_key";
+      project = "org-engine"; name = "ORG_APP_PRIVATE_KEY";
+    })
+  ];
+  # ...and every repository that must receive it.
+  syncs = map (repo: nixfisical.lib.mkGithubSync {
+    owner = "example"; inherit repo;
+    project = "org-engine"; connection = "example-github";
+  }) [ ".github" "platform" "api" ];
+};
+```
+
+`nix run .#infisical-sync` now runs three commands in order: `sync` (projects,
+folders, secret values), **`syncs`** (the outbound syncs, which need those
+projects to exist), then `sync-access`. `--dry-run` covers all three.
+
+What `syncs` does and does not do:
+
+- `project` and `connection` are **names**; the reconciler resolves the ids.
+- A connection is **never created**. Authorising one is a browser round-trip
+  with the provider (for GitHub, an App the instance admin registers and
+  installs), so it is done once in the UI under *App Connections*, with the
+  name the declaration uses. A declared connection that does not exist is an
+  error for that sync; the others still converge.
+- Drift is patched field by field; a changed `destination` is refused, because
+  that is a different sync (remove it, let prune delete it, re-declare).
+- **Prune is per project**: an undeclared sync in a declared project is
+  deleted, and nothing outside declared projects is touched. Deleting a sync
+  never removes what it already wrote downstream.
+- `--run` triggers every declared sync after converging -- the first push, or
+  a forced re-push. Creation already starts one when auto-sync is on.
+
+`mkGithubSync` is the one-repository case (`scope = "repository"`); GitHub
+accepts only `overwrite-destination` as the initial behaviour because Actions
+secrets cannot be read back, so that is not a parameter. `mkSync` is the
+generic form for the other 48 destinations: pass `destination`,
+`syncOptions` and `destinationConfig` exactly as `docs/openapi.json` spells
+them, and `app` when the connection kind differs from the destination slug
+(`aws-parameter-store` connects through `aws`).
+
 ## Quick start
 
 ```sh

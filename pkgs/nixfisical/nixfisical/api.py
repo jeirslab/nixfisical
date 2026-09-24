@@ -913,3 +913,83 @@ class InfisicalClient:
             json={"role": role},
             description=f"add identity to project with role {role!r}",
         )
+
+    # -- app connections and secret syncs ----------------------------------
+    #
+    # The outbound half: Infisical pushing secrets onward on its own schedule.
+    # A sync always names a connection; connections are referenced by name
+    # here and never created -- authorising one is a browser round-trip with
+    # GitHub (or whichever provider), which no reconciler should own.
+
+    def get_app_connection(self, app: str, name: str) -> dict[str, Any] | None:
+        """Return the connection of kind ``app`` named ``name``, or ``None``.
+
+        ``app`` is the provider slug in the URL (``github``, ``aws``, ...).
+        404 is the documented answer for "no such name" and is returned as
+        ``None`` so the caller can report a missing connection as one error
+        among many rather than aborting the run.
+        """
+        status, payload = self._request(
+            "GET",
+            f"/api/v1/app-connections/{app}/connection-name/{name}",
+            allow_status={404},
+            description=f"look up {app} connection {name!r}",
+        )
+        if status == 404:
+            return None
+        connection = payload.get("appConnection")
+        return connection if isinstance(connection, dict) else None
+
+    def list_secret_syncs(self, project_id: str) -> list[dict[str, Any]]:
+        """Every secret sync in a project, across all destinations."""
+        _, payload = self._request(
+            "GET",
+            "/api/v1/secret-syncs",
+            params={"projectId": project_id},
+            description="list secret syncs",
+        )
+        syncs = payload.get("secretSyncs") or []
+        return [sync for sync in syncs if isinstance(sync, dict)]
+
+    def create_secret_sync(self, destination: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """``POST /secret-syncs/{destination}``; returns the created sync."""
+        _, payload = self._request(
+            "POST",
+            f"/api/v1/secret-syncs/{destination}",
+            json=body,
+            description=f"create {destination} sync {body.get('name')!r}",
+        )
+        sync = payload.get("secretSync")
+        return sync if isinstance(sync, dict) else payload
+
+    def update_secret_sync(
+        self, destination: str, sync_id: str, body: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """``PATCH /secret-syncs/{destination}/{id}``; returns the updated sync."""
+        _, payload = self._request(
+            "PATCH",
+            f"/api/v1/secret-syncs/{destination}/{sync_id}",
+            json=body,
+            description=f"update {destination} sync {body.get('name') or sync_id!r}",
+        )
+        sync = payload.get("secretSync")
+        return sync if isinstance(sync, dict) else payload
+
+    def delete_secret_sync(
+        self, destination: str, sync_id: str, *, remove_secrets: bool = False
+    ) -> None:
+        """Delete a sync. ``remove_secrets`` also unwinds what it wrote downstream."""
+        self._request(
+            "DELETE",
+            f"/api/v1/secret-syncs/{destination}/{sync_id}",
+            params={"removeSecrets": "true" if remove_secrets else "false"},
+            description=f"delete {destination} sync {sync_id}",
+        )
+
+    def trigger_secret_sync(self, destination: str, sync_id: str) -> None:
+        """Run a sync now (``POST .../sync-secrets``)."""
+        self._request(
+            "POST",
+            f"/api/v1/secret-syncs/{destination}/{sync_id}/sync-secrets",
+            description=f"trigger {destination} sync {sync_id}",
+        )
