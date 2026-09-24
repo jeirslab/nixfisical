@@ -39,7 +39,7 @@ class RecordingClient:
     def list_projects(self, organization_id: str) -> dict[str, str]:
         return dict(self.projects)
 
-    def create_project(self, name: str) -> str:  # pragma: no cover - not reached
+    def create_project(self, name: str, **kwargs: Any) -> str:  # pragma: no cover - not reached
         raise AssertionError("project should already exist in these tests")
 
     def create_environment(self, project_id: str, *, name: str, slug: str) -> bool:

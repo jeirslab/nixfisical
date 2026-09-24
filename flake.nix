@@ -89,11 +89,16 @@
       # `extraSecrets` is a list of `lib.mkExportOnly` results: secrets to
       # export that no host declares. See the comment on `mkExportOnly` for
       # when that is the honest thing to do rather than a shortcut.
-      mkManifestApp = { pkgs, nixosConfigurations, extraSecrets ? [ ], syncs ? [ ], validate ? true }:
+      mkManifestApp = { pkgs, nixosConfigurations, extraSecrets ? [ ], syncs ? [ ], projects ? { }, validate ? true }:
         let
           raw = nixfisicalLib.manifestFrom { inherit nixosConfigurations extraSecrets; };
           manifest = if validate then nixfisicalLib.assertManifest raw else raw;
           json = builtins.toJSON manifest;
+          # Per-project metadata (`nixfisical sync --projects`): today just a
+          # description per project name. Kept beside the secrets manifest
+          # rather than inside it because a project has no (sopsFile, sopsKey)
+          # and the manifest is a list of those.
+          projectsJson = builtins.toJSON (if validate then nixfisicalLib.assertProjects projects else projects);
           # The outbound half (`nixfisical syncs`): a second, smaller manifest
           # rather than a second kind of entry in the first, so every existing
           # consumer of the secrets manifest keeps reading a list of secrets.
@@ -105,12 +110,16 @@
           text = ''
             M=${pkgs.lib.escapeShellArg json}
             S=${pkgs.lib.escapeShellArg syncsJson}
+            P=${pkgs.lib.escapeShellArg projectsJson}
             case "''${1:-json}" in
               json)
                 printf '%s' "$M" | jq '.'
                 ;;
               syncs)
                 printf '%s' "$S" | jq '.'
+                ;;
+              projects)
+                printf '%s' "$P" | jq '.'
                 ;;
               table)
                 {
@@ -124,7 +133,7 @@
                 echo "exported secrets: $(printf '%s' "$M" | jq 'length')"
                 ;;
               *)
-                echo "usage: infisical-manifest [json|table|syncs]" >&2
+                echo "usage: infisical-manifest [json|table|syncs|projects]" >&2
                 exit 1
                 ;;
             esac
@@ -184,6 +193,14 @@
           # sync deletes it from Infisical.
         , extraSecrets ? [ ]
         , syncs ? [ ]
+          # Per-project descriptions, `{ <name> = { description = "…"; }; }`,
+          # applied on create and reconciled on every run.
+        , projects ? { }
+          # Delete environments the manifest does not declare, in projects it
+          # does -- EMPTY ones only; a non-empty one is reported and kept.
+          # Off by default because it is the one thing `sync` deletes that is
+          # not a secret the manifest once declared.
+        , pruneEnvironments ? false
         , validate ? true
         , adminFile ? "secrets/infisical-admin.yaml"
           # The age identity to decrypt with, if SOPS_AGE_KEY_FILE is not
@@ -241,8 +258,11 @@
         }:
         let
           manifestApp = self.mkManifestApp {
-            inherit pkgs nixosConfigurations extraSecrets syncs validate;
+            inherit pkgs nixosConfigurations extraSecrets syncs projects validate;
           };
+          syncArgs =
+            lib.optionalString pruneEnvironments " --prune-environments"
+            + lib.optionalString (projects != { }) " --projects \"$projects_manifest\"";
           inherit (pkgs) lib;
           # An operator entry -> the `EMAIL[:ROLE]` string the CLI parses.
           # Rejecting an attrset without `email` here rather than emitting
@@ -311,8 +331,10 @@
             # A file rather than a pipe: both subcommands read the manifest, and
             # `-` can only be consumed once.
             manifest=$(mktemp)
-            trap 'rm -f "$manifest"' EXIT
+            projects_manifest=$(mktemp)
+            trap 'rm -f "$manifest" "$projects_manifest"' EXIT
             infisical-manifest json > "$manifest"
+            infisical-manifest projects > "$projects_manifest"
 
             if [ "''${1-}" = "--dry-run" ]; then
               nixfisical --url ${pkgs.lib.escapeShellArg url} \
@@ -322,12 +344,12 @@
 
             nixfisical --url ${pkgs.lib.escapeShellArg url} \
               --admin-file ${pkgs.lib.escapeShellArg adminFile} \
-              sync --manifest "$manifest" "$@"
+              sync --manifest "$manifest"${syncArgs} "$@"
             echo ""
             ${pkgs.lib.optionalString (syncs != [ ]) ''
             # Outbound syncs, after the projects they live in exist.
             syncs_manifest=$(mktemp)
-            trap 'rm -f "$manifest" "$syncs_manifest"' EXIT
+            trap 'rm -f "$manifest" "$projects_manifest" "$syncs_manifest"' EXIT
             infisical-manifest syncs > "$syncs_manifest"
             nixfisical --url ${pkgs.lib.escapeShellArg url} \
               --admin-file ${pkgs.lib.escapeShellArg adminFile} \

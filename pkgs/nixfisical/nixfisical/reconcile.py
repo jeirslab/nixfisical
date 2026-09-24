@@ -31,13 +31,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from nixfisical.api import InfisicalClient, InfisicalError
 from nixfisical.manifest import LITERAL_SOURCE, entry_source
 from nixfisical.sops import SopsError, read_key
 
-__all__ = ["Action", "ReconcileSummary", "reconcile", "folder_ancestors"]
+__all__ = ["Action", "ReconcileSummary", "reconcile", "folder_ancestors", "validate_projects"]
 
 
 @dataclass(frozen=True)
@@ -81,6 +81,15 @@ class ReconcileSummary:
     # because "sync touched 40 secrets" and "sync touched 31 and deliberately
     # did not touch 9" are different reports.
     secrets_delegated: int = 0
+    # `--prune-environments`: undeclared environments in declared projects.
+    # Deleted only when empty; a non-empty one is kept and counted, because
+    # the manifest never described its contents and deleting them on the
+    # strength of that would be the one destructive act here without a
+    # dry-run line that names each casualty.
+    environments_pruned: int = 0
+    environments_kept: int = 0
+    # Project descriptions reconciled from the projects file.
+    projects_described: int = 0
     groups_seen: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
@@ -120,6 +129,14 @@ class ReconcileSummary:
         """
         return f", delegated {self.secrets_delegated}" if self.secrets_delegated else ""
 
+    @property
+    def _env_prune_clause(self) -> str:
+        """``, environments -N`` (plus ``/kept M``) -- only when pruning ran."""
+        if not self.environments_pruned and not self.environments_kept:
+            return ""
+        kept = f" (kept {self.environments_kept} non-empty)" if self.environments_kept else ""
+        return f", environments -{self.environments_pruned}{kept}"
+
     def headline(self) -> str:
         if self.dry_run:
             # `+` where the run knows, `~` where it would write without knowing
@@ -132,7 +149,7 @@ class ReconcileSummary:
                 f"environments ~{self.environments_planned}, "
                 f"folders ~{self.folders_planned}, "
                 f"secrets ~{self.secrets_planned}, "
-                f"pruned -{self.secrets_pruned}{self._delegated_clause}, "
+                f"pruned -{self.secrets_pruned}{self._env_prune_clause}{self._delegated_clause}, "
                 f"errors {len(self.errors)}"
             )
         return (
@@ -140,7 +157,7 @@ class ReconcileSummary:
             f"environments +{self.environments_created}, "
             f"folders +{self.folders_created}, "
             f"secrets +{self.secrets_created}/~{self.secrets_updated}, "
-            f"pruned -{self.secrets_pruned}{self._delegated_clause}, "
+            f"pruned -{self.secrets_pruned}{self._env_prune_clause}{self._delegated_clause}, "
             f"errors {len(self.errors)}"
         )
 
@@ -175,6 +192,41 @@ def _full_path(parent: str, leaf: str) -> str:
     return f"{parent.rstrip('/')}/{leaf}"
 
 
+def _description_of(meta: Mapping[str, Any] | None) -> str | None:
+    """The declared description, or None when the projects file has none.
+
+    An empty string is a declaration ("no description") and is honoured;
+    a missing key is not, so the instance's own text is left alone.
+    """
+    if meta is None or "description" not in meta:
+        return None
+    value = meta.get("description")
+    return str(value) if value is not None else ""
+
+
+def validate_projects(projects: Mapping[str, Any]) -> list[str]:
+    """Structural problems in a projects file; empty means fine."""
+    problems: list[str] = []
+    if not isinstance(projects, Mapping):
+        return ["projects must be an object keyed by project name"]
+    for name, meta in projects.items():
+        if not isinstance(name, str) or not name.strip():
+            problems.append("projects: empty project name")
+            continue
+        if not isinstance(meta, Mapping):
+            problems.append(f"projects[{name!r}]: must be an object")
+            continue
+        for key in meta:
+            if key != "description":
+                problems.append(f"projects[{name!r}]: unknown field {key!r} (only 'description')")
+        description = meta.get("description")
+        if description is not None and not isinstance(description, str):
+            problems.append(f"projects[{name!r}]: description must be a string")
+        elif isinstance(description, str) and len(description) > 1024:
+            problems.append(f"projects[{name!r}]: description longer than 1024 characters")
+    return problems
+
+
 def _coordinate(entry: dict[str, Any]) -> str:
     """A printable coordinate for an entry. Never includes a value."""
     return (
@@ -190,14 +242,27 @@ def reconcile(
     organization_id: str,
     prune: bool = True,
     dry_run: bool = False,
+    prune_environments: bool = False,
+    projects: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ReconcileSummary:
     """Converge the instance onto ``manifest``.
 
     ``organization_id`` scopes the project listing; it comes from the admin
     file written at bootstrap.
+
+    ``projects`` is per-project metadata keyed by name -- today just
+    ``description`` -- applied on create and reconciled on every run. A
+    project the manifest names but ``projects`` does not is left as it is.
+
+    ``prune_environments`` deletes environments the manifest does not declare
+    in projects it does, but only EMPTY ones: the secret prune above never
+    looked inside an undeclared environment, so anything in there is
+    something this run knows nothing about. Non-empty ones are reported and
+    kept; empty the environment (or declare it) and the next run removes it.
     """
     entries = list(manifest)
     summary = ReconcileSummary(dry_run=dry_run, prune=prune)
+    project_meta: dict[str, Mapping[str, Any]] = dict(projects or {})
 
     groups: set[str] = set()
     for entry in entries:
@@ -216,20 +281,46 @@ def reconcile(
     # -- 2. missing projects ----------------------------------------------
     wanted_projects = sorted({str(entry["project"]) for entry in entries if entry.get("project")})
     for name in wanted_projects:
+        wanted_description = _description_of(project_meta.get(name))
         if name in project_ids:
             summary.record("project", name, "exists")
+            if wanted_description is None:
+                continue
+            # Reconcile the description. One GET per declared project; the
+            # listing endpoint does not return descriptions, so this is the
+            # only way to know whether a PATCH would change anything.
+            try:
+                live = client.get_project(project_ids[name])
+            except InfisicalError as exc:
+                summary.fail("project", name, f"could not read project: {exc}")
+                continue
+            if (live.get("description") or "") == wanted_description:
+                continue
+            if dry_run:
+                summary.projects_described += 1
+                summary.record("project", name, "would-update", "description")
+                continue
+            try:
+                client.update_project(project_ids[name], description=wanted_description)
+            except InfisicalError as exc:
+                summary.fail("project", name, f"update description: {exc}")
+                continue
+            summary.projects_described += 1
+            summary.record("project", name, "updated", "description")
             continue
         if dry_run:
             summary.record("project", name, "would-create")
             summary.projects_created += 1
             continue
         try:
-            project_ids[name] = client.create_project(name)
+            project_ids[name] = client.create_project(name, description=wanted_description)
         except InfisicalError as exc:
             summary.fail("project", name, str(exc))
             continue
         summary.projects_created += 1
-        summary.record("project", name, "created")
+        summary.record(
+            "project", name, "created", "with description" if wanted_description else ""
+        )
 
     def resolve_project(entry: dict[str, Any]) -> str | None:
         """Project id for an entry, or None when it does not exist yet.
@@ -502,6 +593,63 @@ def reconcile(
                     continue
                 summary.secrets_pruned += 1
                 summary.record("prune", target, "deleted", "not in manifest")
+
+    # -- 7. prune environments ---------------------------------------------
+    # Only in declared projects, only undeclared slugs, only when EMPTY. The
+    # default trio Infisical used to seed (Development/Staging/Production) is
+    # exactly this case: three empty environments nobody declared. Anything
+    # holding a secret is kept and named, because step 6 above never listed
+    # an undeclared environment and so has no idea what is in it.
+    if prune_environments:
+        declared_envs: dict[str, set[str]] = {}
+        for project_name, environment in env_pairs:
+            declared_envs.setdefault(project_name, set()).add(environment)
+        for project_name in sorted(declared_envs):
+            project_id = project_ids.get(project_name)
+            if project_id is None:
+                summary.record(
+                    "prune-env", project_name, "skipped", "project does not exist yet"
+                )
+                continue
+            try:
+                live_project = client.get_project(project_id)
+            except InfisicalError as exc:
+                summary.fail("prune-env", project_name, f"could not list environments: {exc}")
+                continue
+            for env in live_project.get("environments") or []:
+                slug = env.get("slug")
+                env_id = env.get("id")
+                if not slug or not env_id or slug in declared_envs[project_name]:
+                    continue
+                target = f"{project_name}/{slug}"
+                try:
+                    contents = client.list_secrets(
+                        project_id=project_id, environment=slug, path="/"
+                    )
+                except InfisicalError as exc:
+                    summary.fail("prune-env", target, f"could not list secrets: {exc}")
+                    continue
+                if contents:
+                    summary.environments_kept += 1
+                    summary.record(
+                        "prune-env",
+                        target,
+                        "kept",
+                        f"not declared but holds {len(contents)} secret(s); "
+                        "empty it or declare it",
+                    )
+                    continue
+                if dry_run:
+                    summary.environments_pruned += 1
+                    summary.record("prune-env", target, "would-delete", "not declared, empty")
+                    continue
+                try:
+                    client.delete_environment(project_id, str(env_id))
+                except InfisicalError as exc:
+                    summary.fail("prune-env", target, str(exc))
+                    continue
+                summary.environments_pruned += 1
+                summary.record("prune-env", target, "deleted", "not declared, empty")
 
     # Group access is deliberately not reconciled here: it needs different
     # credentials (and, to create a group at all, a database connection), it

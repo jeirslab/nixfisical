@@ -546,6 +546,49 @@ propagates.
 first-deploy run leaves the credentials tracked rather than sitting untracked
 in a working tree waiting to be lost.
 
+### Environments the declaration does not name
+
+Infisical seeds every new project with Development, Staging and Production.
+`sync` creates projects **without** them (`shouldCreateDefaultEnvs: false`)
+and then creates exactly the environments the manifest declares, so a fresh
+estate never sees the trio. For projects that already have them, or for an
+environment you renamed away from:
+
+```sh
+nixfisical sync --manifest manifest.json --prune-environments --dry-run
+nixfisical sync --manifest manifest.json --prune-environments
+```
+
+The rule is narrow on purpose. It deletes an environment only when it is in
+a project the manifest declares, is not itself declared, **and holds no
+secrets**. The secret prune never lists an undeclared environment, so the run
+has no idea what a non-empty one contains; it is reported as `kept`, with the
+count, and left alone until you empty it or declare it. The dry run names
+every deletion. `mkSyncApp { pruneEnvironments = true; }` turns it on for the
+flake app.
+
+### Project descriptions
+
+A project has one piece of metadata the manifest cannot carry, because the
+manifest is a list of secrets: its description. Declare it beside the
+manifest and `sync` applies it on create and reconciles it on every run:
+
+```nix
+infisical-sync = nixfisical.mkSyncApp {
+  # …
+  projects = {
+    bitcoin-infrastructure.description = "Nodes, indexers and their databases — mainnet / testnet4 / signet.";
+    backend-core.description = "Order ledger schemas on app-db and backend-api-v2-db.";
+  };
+};
+```
+
+`infisical-manifest projects` prints the JSON that `sync --projects` reads: an
+object keyed by project name with, today, only `description`. A project the
+manifest names but `projects` does not is left as it is, so adopting this is
+incremental. `assertProjects` fails evaluation on an unknown field or a
+description over the API's 1024-character cap.
+
 ### Adopting an instance you did not bootstrap
 
 `POST /api/v1/admin/bootstrap` succeeds exactly **once** in an instance's life.
