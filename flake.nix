@@ -108,8 +108,17 @@
           name = "infisical-manifest";
           runtimeInputs = [ pkgs.jq pkgs.util-linux ];
           text = ''
+            # The three payloads are single-quoted JSON literals. A description
+            # or a sync name that contains a backtick or a `$` is data, not an
+            # expression, and shellcheck's SC2016 ("expressions don't expand in
+            # single quotes") is exactly the wrong advice here -- it would fail
+            # the build of any consumer whose project description mentions a
+            # shell variable.
+            # shellcheck disable=SC2016
             M=${pkgs.lib.escapeShellArg json}
+            # shellcheck disable=SC2016
             S=${pkgs.lib.escapeShellArg syncsJson}
+            # shellcheck disable=SC2016
             P=${pkgs.lib.escapeShellArg projectsJson}
             case "''${1:-json}" in
               json)
