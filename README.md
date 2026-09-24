@@ -260,6 +260,45 @@ generic form for the other 48 destinations: pass `destination`,
 them, and `app` when the connection kind differs from the destination slug
 (`aws-parameter-store` connects through `aws`).
 
+### Values that are not secrets
+
+Every `.env` a developer renders needs the port next to the password and the
+host next to the token, and none of those are secrets. They are in the fleet
+manifest, in DNS, in a world-readable store path already. Putting them in a
+SOPS file to get them exported would be `mkExportOnly`'s warning in reverse —
+a lie about what is sensitive, this time — so a literal names its value:
+
+```nix
+nixfisical.lib.mkLiteral {
+  project     = "bitcoin-nodes";
+  environment = "mainnet";
+  folder      = "/bitcoind";
+  name        = "BITCOIND_RPC_PORT";
+  value       = 8332;                  # toString'd
+  groups      = [ "developers" ];
+}
+```
+
+Pass them as `extraSecrets`, like export-only entries. A literal is an
+ordinary manifest entry with `source = "literal"`: validated, deduped, pruned
+when the declaration goes. `sync` pushes it like a SOPS value with the
+decryption step skipped; `import` never claims it. The rendered folder is then
+complete — a developer's dotenv template gives them a working connection, not
+a list of passwords with nowhere to point them.
+
+The value lands in the manifest, and the manifest lands in the store. That is
+fine for a port and a hostname, and it is why `value` is legal **only** on a
+literal: `assertManifest` and `nixfisical validate` both refuse it on any other
+entry, because there it would be a plaintext copy of a secret in the store.
+The `mkInfisical` and `mkExportOnly` constructors cannot produce one; the check
+exists for the hand-built entry.
+
+A fleet whose manifest already knows every host's address can generate these
+rather than write them — walk the hosts that export something, emit
+`HOST_IP` and `HOST_TAILNET` for each — which is the intended use: the
+declaration site of a secret says *that* it is developer-facing, and the fleet
+manifest supplies the facts around it.
+
 ## Quick start
 
 ```sh
@@ -293,11 +332,13 @@ updated, and **deleted**. Run it first.
 | --- | --- |
 | `lib.mkInfisical` | Annotate a `sops.secrets` entry for export. |
 | `lib.mkExportOnly` | Export a secret no host declares. |
+| `lib.mkLiteral` | Export a value that is not a secret (a port, a hostname) beside the ones that are. |
 | `lib.manifestOf` | `nixosConfigurations` → manifest list. |
 | `lib.manifestFrom` | `{ nixosConfigurations, extraSecrets }` → manifest list. |
 | `lib.assertManifest` | Fail evaluation on a malformed manifest. |
 | `lib.mkDotenvTemplate` | A Go template dumping one Infisical folder as dotenv. |
 | `mkManifestApp` | Wrap a manifest as a `nix run .#infisical-manifest` app. |
+| `mkAgentConfigApp` | Render an agent bundle (`agent.yaml` + dotenv templates) for a host that is not NixOS. |
 | `nixosModules.export` | Adds `sops.secrets.<key>.infisical`. |
 | `nixosModules.server` | Runs a self-hosted instance. |
 | `nixosModules.default` | Both of the above. |
@@ -1203,6 +1244,46 @@ in the store.
 The agent reads `INFISICAL_UNIVERSAL_AUTH_CLIENT_ID` from the environment in
 preference to the file, so an exported variable silently wins over the
 configuration.
+
+### A host that is not NixOS
+
+The module above needs home-manager. A shared developer box that is Debian, a
+CI runner, a workstation image — anything with the upstream binary and systemd
+but no module system — gets the same agent from a rendered bundle instead:
+
+```sh
+nixfisical --url https://infisical.example.com agent-config \
+  --manifest manifest.json \
+  --out ./agent-bundle \
+  --install-root /etc/infisical-agent \
+  --client-id-file /etc/infisical-agent/client-id \
+  --client-secret-file /etc/infisical-agent/client-secret \
+  --group developers
+```
+
+The result is a directory: `agent.yaml`, one `templates/*.tmpl` per
+`(project, environment, folder)` the manifest exports to the named group, and
+`destinations.txt` listing where each renders. Copy it to `--install-root` on
+the host, run `infisical agent --config /etc/infisical-agent/agent.yaml` as a
+unit, and every folder appears as
+`/run/secrets/env/<project>/<folder>/<environment>.env` — the same shape the
+home-manager module's `dotenv.enable` produces, from the same template text,
+so the two kinds of machine render the same file from the same declaration.
+
+Nothing in the bundle is a secret. The credentials are named by path and read
+by the agent at run time; `nixfisical provision-host` mints them and the host's
+own configuration management delivers the two files. The bundle can be
+committed.
+
+It needs the instance for one thing: project ids, which the manifest does not
+carry. Run it after `sync`, or pin them with `--project-id NAME=ID` and it
+reads nothing from the network. `mkAgentConfigApp` wraps it the way `mkSyncApp`
+wraps `sync`, manifest included.
+
+`destinations.txt` exists because `os.Create` leaves a fresh file at 0644. The
+home-manager module creates every destination under `umask 077` before the
+agent starts; on a bundle host that is the unit's `ExecStartPre`, and this is
+the list it needs.
 
 ## The agent surface
 

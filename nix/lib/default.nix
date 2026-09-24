@@ -10,6 +10,8 @@
 # plus an escape hatch for secrets no host declares:
 #
 #   mkExportOnly  names a (sopsFile, sopsKey) directly, with no host behind it.
+#   mkLiteral     a value that is not a secret (a port, a hostname), carried
+#                 in the manifest itself and pushed beside the secrets.
 #   manifestFrom  the general form of manifestOf — hosts and export-only
 #                 entries merged into one manifest.
 #
@@ -100,6 +102,51 @@ rec {
       sopsFile = toString sopsFile;
       host = null;
       name = if name != null then name else lib.last (lib.splitString "/" sopsKey);
+    };
+
+  # A value that is NOT a secret, exported beside the ones that are.
+  #
+  # Every rendered .env needs the port next to the password and the host next
+  # to the token, and none of those are secrets -- they are in the fleet
+  # manifest, in DNS, in the world-readable store. Forcing them into a SOPS
+  # file to get them exported would be the accommodation `mkExportOnly` warns
+  # against, in the other direction. So a literal names its value directly:
+  #
+  #   nixfisical.lib.mkLiteral {
+  #     project     = "bitcoin-nodes";
+  #     environment = "mainnet";
+  #     folder      = "/bitcoind";
+  #     name        = "BITCOIND_RPC_PORT";
+  #     value       = 8332;                 # toString'd; keep it a string or an int
+  #     groups      = [ "developers" ];
+  #   }
+  #
+  # It is an ordinary manifest entry: validated, deduped on its coordinate,
+  # PRUNED when the declaration goes. `sync` pushes it like a SOPS value with
+  # the decryption step skipped; `import` never claims it. `sopsKey` is a
+  # synthetic identity so the dedupe and every error message have a name to
+  # use -- it is not a lookup path and no file is ever opened for it.
+  #
+  # The value lands in the manifest, and the manifest lands in the store. That
+  # is fine for a port and a hostname and is exactly why `assertManifest`
+  # refuses a `value` on any entry that is not a literal.
+  #
+  # `host` is provenance only, as everywhere else in the manifest: pass the
+  # host the value describes so the table shows it, or leave it null.
+  mkLiteral =
+    { project
+    , name
+    , value
+    , folder ? "/"
+    , environment ? "prod"
+    , groups ? [ ]
+    , host ? null
+    }: {
+      inherit project folder environment groups name host;
+      value = toString value;
+      source = "literal";
+      sopsFile = null;
+      sopsKey = "literal:${project}/${environment}${folder}:${name}";
     };
 
   # nixosConfigurations -> [ manifestEntry ]
@@ -341,7 +388,19 @@ rec {
 
   assertManifest = manifest:
     let
-      missingFile = lib.filter (e: e.sopsFile == null) manifest;
+      isLiteral = e: (e.source or "sops") == "literal";
+      missingFile = lib.filter (e: e.sopsFile == null && !(isLiteral e)) manifest;
+
+      # A literal with nothing in it renders as `KEY=` and is read by every
+      # dotenv parser as the empty string -- a port of "" is a bug that shows
+      # up as a connection refused somewhere else. Caught here by name.
+      emptyLiteral = lib.filter (e: isLiteral e && (e.value or "") == "") manifest;
+
+      # The mirror image, and the one that matters: a `value` on anything but
+      # a literal is a plaintext secret in the manifest, and the manifest is in
+      # the store. `mkInfisical` and `mkExportOnly` cannot produce one, so this
+      # only fires on a hand-built entry -- which is exactly where it should.
+      strayValue = lib.filter (e: !(isLiteral e) && (e ? value)) manifest;
       badEnv = lib.filter
         (e: builtins.match "[a-z0-9-]+" e.environment == null)
         manifest;
@@ -361,7 +420,7 @@ rec {
       # catches this for host-derived entries; nothing catches it for
       # `mkExportOnly` or a hand-built one, so it is caught here.
       badSource = lib.filter
-        (e: !(lib.elem (e.source or "sops") [ "sops" "infisical" ]))
+        (e: !(lib.elem (e.source or "sops") [ "sops" "infisical" "literal" ]))
         manifest;
 
       # Two entries writing the same Infisical coordinate: one wins, and which
@@ -396,7 +455,9 @@ rec {
         ++ (err "folder paths must be absolute (start with /)" badFolder)
         ++ (errBy "whole-file secrets (key = \"\") cannot be exported; name a key" emptyKey)
         ++ (errBy "two secrets declared into the same Infisical destination" dupDest)
-        ++ (err "source must be \"sops\" or \"infisical\"" badSource);
+        ++ (err "source must be \"sops\", \"infisical\" or \"literal\"" badSource)
+        ++ (errBy "literal values must not be empty" emptyLiteral)
+        ++ (errBy "only a literal may carry a `value`; a SOPS-owned value belongs in its encrypted file" strayValue);
     in
     if problems == [ ]
     then manifest
