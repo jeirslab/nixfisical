@@ -11,6 +11,7 @@ Commands map onto the jobs described in the package docstring:
     nixfisical provision-host  mint a host's own identity for direct injection
     nixfisical keyring     store age and SSH keys, and audit who reads them
     nixfisical validate    check a manifest, offline
+    nixfisical agent-config  render an Infisical agent bundle for a non-Nix host
     nixfisical status      is the instance up, and can we still log in?
     nixfisical license     which licence-gated features does it permit?
     nixfisical secrets     manage the SOPS store the manifest reads from
@@ -81,6 +82,12 @@ from nixfisical.access import (
     database_from_env,
     parse_operators,
     sync_access as run_sync_access,
+)
+from nixfisical.agentconfig import (
+    AgentConfigError,
+    plan_templates,
+    render_agent_config,
+    write_bundle,
 )
 from nixfisical.api import InfisicalClient, InfisicalError
 from nixfisical.docs import emit as docs_emit
@@ -1717,6 +1724,173 @@ def validate_command(manifest_source: str, secrets_file: Path | None) -> None:
         sys.exit(EXIT_VALIDATION)
 
     click.secho(f"manifest ok: {len(manifest)} entr(y|ies) validated", fg="green")
+
+
+# --------------------------------------------------------------------------
+# agent-config
+# --------------------------------------------------------------------------
+
+
+def _parse_project_ids(flags: tuple[str, ...]) -> dict[str, str]:
+    """``NAME=ID`` flags into a map, refusing anything that is not that shape."""
+    pinned: dict[str, str] = {}
+    for flag in flags:
+        name, sep, value = flag.partition("=")
+        if not sep or not name.strip() or not value.strip():
+            _fail(f"--project-id expects NAME=ID, got {flag!r}", EXIT_VALIDATION)
+        pinned[name.strip()] = value.strip()
+    return pinned
+
+
+@cli.command("agent-config")
+@click.option(
+    "--manifest",
+    "manifest_source",
+    default="-",
+    show_default=True,
+    help="Path to the JSON manifest, or '-' for stdin.",
+)
+@click.option(
+    "--out",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="Directory to write agent.yaml, templates/ and destinations.txt into.",
+)
+@click.option(
+    "--install-root",
+    default=None,
+    help="Where the bundle will live ON THE TARGET HOST; template source paths "
+    "are written under it. Defaults to --out made absolute, which is right "
+    "only when the bundle is rendered in place.",
+)
+@click.option(
+    "--dest-root",
+    default="/run/secrets/env",
+    show_default=True,
+    help="Root of the rendered tree on the target host: "
+    "<root>/<project>/<folder>/<environment>.env",
+)
+@click.option(
+    "--client-id-file",
+    required=True,
+    help="Path ON THE TARGET HOST to the universal-auth client id. Written into "
+    "the configuration as a path; never read here.",
+)
+@click.option(
+    "--client-secret-file",
+    required=True,
+    help="Path ON THE TARGET HOST to the universal-auth client secret. Same rule.",
+)
+@click.option(
+    "--group",
+    "groups",
+    multiple=True,
+    help="Render only folders some entry exports to this group. Repeatable. "
+    "Default: every folder in the manifest.",
+)
+@click.option(
+    "--polling-interval",
+    default="60s",
+    show_default=True,
+    help="How often the agent re-renders each template (Go duration).",
+)
+@click.option(
+    "--project-id",
+    "project_id_flags",
+    multiple=True,
+    metavar="NAME=ID",
+    help="Pin a project's id instead of resolving it from the instance. "
+    "Repeatable. When every project the bundle needs is pinned, nothing is "
+    "read from the network and no admin file is opened.",
+)
+@click.pass_context
+def agent_config_command(
+    ctx: click.Context,
+    manifest_source: str,
+    out: Path,
+    install_root: str | None,
+    dest_root: str,
+    client_id_file: str,
+    client_secret_file: str,
+    groups: tuple[str, ...],
+    polling_interval: str,
+    project_id_flags: tuple[str, ...],
+) -> None:
+    """Render an Infisical agent bundle for a host that is not NixOS.
+
+    One dotenv template per (project, environment, folder) the manifest
+    exports, plus the agent.yaml that renders them into
+    ``<dest-root>/<project>/<folder>/<environment>.env`` on the target host.
+    Nothing in the bundle is a secret: credentials are named by path and
+    read by the agent at run time. Project ids are resolved against the
+    instance as ``fleet-sync`` unless every one is pinned with --project-id.
+    """
+    try:
+        manifest = load_manifest(manifest_source)
+    except ValueError as exc:
+        _fail(str(exc), EXIT_VALIDATION)
+        return
+
+    # `require_sops_file=False`: this reads coordinates only and never opens
+    # a SOPS file, the same exemption `sync-access` has and for the same reason.
+    problems = validate_manifest(manifest, require_sops_file=False)
+    if problems:
+        click.secho(f"manifest has {len(problems)} problem(s):", fg="red", err=True)
+        for problem in problems:
+            click.echo(f"  - {problem}", err=True)
+        sys.exit(EXIT_VALIDATION)
+
+    specs = plan_templates(manifest, set(groups) or None)
+    if not specs:
+        _fail(
+            "nothing to render: no manifest entry matches"
+            + (f" groups {', '.join(groups)}" if groups else ""),
+            EXIT_VALIDATION,
+        )
+        return
+
+    project_ids = _parse_project_ids(project_id_flags)
+    unresolved = sorted({spec.project for spec in specs} - set(project_ids))
+    if unresolved:
+        admin_file: Path = ctx.obj["admin_file"]
+        with _client(ctx) as client:
+            try:
+                organization_id = read_organization_id(admin_file)
+                client.universal_auth_login(read_sync_credentials(admin_file))
+                live = client.list_projects(organization_id)
+            except (SopsError, InfisicalError) as exc:
+                _fail(
+                    f"could not resolve project ids for {', '.join(unresolved)} "
+                    f"with {admin_file}: {exc}. Pin them with --project-id NAME=ID "
+                    "to render offline."
+                )
+                return
+        # Pinned ids win over live ones: a pin is the operator saying so.
+        project_ids = {**live, **project_ids}
+
+    try:
+        config, templates = render_agent_config(
+            specs,
+            address=ctx.obj["url"],
+            project_ids=project_ids,
+            client_id_file=client_id_file,
+            client_secret_file=client_secret_file,
+            install_root=install_root or str(Path(out).resolve()),
+            dest_root=dest_root,
+            polling_interval=polling_interval,
+        )
+    except AgentConfigError as exc:
+        _fail(str(exc), EXIT_VALIDATION)
+        return
+
+    written = write_bundle(Path(out), config, templates)
+    for path in written:
+        click.echo(f"  wrote {path}")
+    click.secho(
+        f"agent bundle: {len(templates)} template(s) for "
+        f"{len({spec.project for spec in specs})} project(s) in {out}",
+        fg="green",
+    )
 
 
 # --------------------------------------------------------------------------

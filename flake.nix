@@ -339,6 +339,70 @@
               sync-access --manifest "$manifest"${accessArgs} "$@"
           '';
         };
+
+      # The same manifest, rendered as an Infisical AGENT bundle for a host
+      # that is not NixOS -- a Debian developer box, a CI runner, anything with
+      # the upstream binary and systemd but no module system:
+      #
+      #   packages.infisical-agent-config = nixfisical.mkAgentConfigApp {
+      #     inherit pkgs;
+      #     nixosConfigurations = self.nixosConfigurations;
+      #     url = "https://infisical.example.org";
+      #   };
+      #
+      #   nix run .#infisical-agent-config -- --out ./agent-bundle \
+      #     --install-root /etc/infisical-agent \
+      #     --client-id-file /etc/infisical-agent/client-id \
+      #     --client-secret-file /etc/infisical-agent/client-secret \
+      #     --group developers
+      #
+      # Every flag after `--` is `nixfisical agent-config`'s own; see its help.
+      # The result is a directory -- agent.yaml, templates/, destinations.txt --
+      # for the host's configuration management to copy into `--install-root`.
+      # Nothing in it is a secret; see pkgs/nixfisical/nixfisical/agentconfig.py.
+      #
+      # It needs the instance, for one thing only: project ids, which the
+      # manifest does not carry. Run it after `infisical-sync`, or pin them
+      # with `--project-id NAME=ID` and it touches no network at all.
+      mkAgentConfigApp =
+        { pkgs
+        , nixosConfigurations
+        , url
+        , extraSecrets ? [ ]
+        , validate ? true
+        , adminFile ? "secrets/infisical-admin.yaml"
+          # Same contract as on mkSyncApp: the age identity to decrypt the
+          # admin file with when SOPS_AGE_KEY_FILE is not already set.
+        , ageKeyFile ? null
+        , nixfisical ? self.packages.${pkgs.stdenv.hostPlatform.system}.nixfisical
+        }:
+        let
+          manifestApp = self.mkManifestApp {
+            inherit pkgs nixosConfigurations extraSecrets validate;
+          };
+        in
+        pkgs.writeShellApplication {
+          name = "infisical-agent-config";
+          runtimeInputs = [ manifestApp nixfisical pkgs.coreutils ];
+          text = ''
+            ${pkgs.lib.optionalString (ageKeyFile != null) ''
+            : "''${SOPS_AGE_KEY_FILE:=${ageKeyFile}}"
+            if [ -f "$SOPS_AGE_KEY_FILE" ]; then
+              export SOPS_AGE_KEY_FILE
+            else
+              echo "infisical-agent-config: no age identity at $SOPS_AGE_KEY_FILE;" \
+                   "falling back to sops' own search" >&2
+            fi
+            ''}
+            manifest=$(mktemp)
+            trap 'rm -f "$manifest"' EXIT
+            infisical-manifest json > "$manifest"
+
+            nixfisical --url ${pkgs.lib.escapeShellArg url} \
+              --admin-file ${pkgs.lib.escapeShellArg adminFile} \
+              agent-config --manifest "$manifest" "$@"
+          '';
+        };
     }
     // flake-utils.lib.eachDefaultSystem (system:
       let

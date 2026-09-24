@@ -25,6 +25,30 @@ the value of a ``"sops"`` entry and refuses to touch an ``"infisical"`` one;
 them, never both. It is optional and defaults to ``"sops"``, so a manifest
 rendered before the field existed still means what it always meant.
 
+A third ``source``, ``"literal"``, carries its value in the manifest itself::
+
+    {
+      "sopsKey":     "literal:bitcoin-nodes/mainnet/bitcoind:BITCOIND_RPC_PORT",
+      "sopsFile":    null,
+      "project":     "bitcoin-nodes",
+      "environment": "mainnet",
+      "folder":      "/bitcoind",
+      "name":        "BITCOIND_RPC_PORT",
+      "value":       "8332",
+      "groups":      ["developers"],
+      "hosts":       [],
+      "source":      "literal"
+    }
+
+It exists for the configuration that sits next to secrets in every ``.env``
+file and is not itself secret -- a port, an address, a hostname -- so that the
+folder a developer renders is complete rather than a list of passwords with no
+host to use them against. ``reconcile`` pushes a literal exactly like a SOPS
+value, minus the decryption; ``pull`` never claims one. The manifest lives in a
+world-readable store path on every host that imports the export module, which
+is the reason ``value`` is *only* legal on a literal: a SOPS-owned value in the
+manifest would be a plaintext copy of the secret in the store.
+
 ``sopsFile`` being per-entry is the principal improvement over the Ansible
 role, which had one global ``infisical_secrets_file``. Secrets in a real estate
 are split across files along trust boundaries, and forcing them into one file
@@ -46,6 +70,7 @@ from typing import Any, Iterable
 __all__ = [
     "REQUIRED_FIELDS",
     "SOURCES",
+    "LITERAL_SOURCE",
     "load",
     "validate",
     "resolve_paths",
@@ -57,7 +82,13 @@ __all__ = [
 # default direction: the encrypted file is the truth and ``sync`` pushes it up.
 # ``infisical`` reverses it for that one secret -- ``sync`` stops writing the
 # value, ``import`` starts writing the SOPS file.
-SOURCES: tuple[str, ...] = ("sops", "infisical")
+SOURCES: tuple[str, ...] = ("sops", "infisical", "literal")
+
+# ``literal`` is the one source whose value travels *in* the manifest. It is
+# pushed by ``reconcile`` like a SOPS value and never claimed by ``pull``; the
+# checks in :func:`validate` are what keep ``value`` off every other kind of
+# entry, because a manifest ends up in the Nix store.
+LITERAL_SOURCE = "literal"
 
 # Fields every entry must carry. ``sopsFile`` is deliberately absent: it may be
 # supplied per entry or fall back to a global default, so it is checked
@@ -183,16 +214,6 @@ def validate(
                     "(lowercase letters, digits and '-' only)"
                 )
 
-        sops_file = entry.get("sopsFile")
-        if sops_file is not None and (not isinstance(sops_file, str) or not sops_file.strip()):
-            problems.append(f"{label}: sopsFile must be a non-empty string when present")
-        elif sops_file is None and default_secrets_file is None and require_sops_file:
-            sops_key = entry.get("sopsKey", "<unknown>")
-            problems.append(
-                f"{label}: no sopsFile and no --secrets-file default; "
-                f"cannot resolve a value for sopsKey {sops_key!r}"
-            )
-
         source = entry.get("source")
         if source is not None and (
             not isinstance(source, str) or source not in SOURCES
@@ -200,6 +221,42 @@ def validate(
             problems.append(
                 f"{label}: source {source!r} must be one of "
                 f"{', '.join(repr(name) for name in SOURCES)} (absent means 'sops')"
+            )
+        is_literal = source == LITERAL_SOURCE
+
+        sops_file = entry.get("sopsFile")
+        if sops_file is not None and (not isinstance(sops_file, str) or not sops_file.strip()):
+            problems.append(f"{label}: sopsFile must be a non-empty string when present")
+        elif (
+            sops_file is None
+            and default_secrets_file is None
+            and require_sops_file
+            and not is_literal
+        ):
+            sops_key = entry.get("sopsKey", "<unknown>")
+            problems.append(
+                f"{label}: no sopsFile and no --secrets-file default; "
+                f"cannot resolve a value for sopsKey {sops_key!r}"
+            )
+
+        # ``value`` is legal on a literal and nowhere else. The manifest is
+        # world-readable on every host that imports the export module, so a
+        # value on a SOPS-owned entry is a plaintext copy of a secret in the
+        # store -- and a generator bug that must not pass quietly.
+        value = entry.get("value")
+        if is_literal:
+            if not isinstance(value, str) or not value.strip():
+                problems.append(
+                    f"{label}: a literal entry needs a non-empty string 'value'"
+                )
+            if sops_file is not None:
+                problems.append(
+                    f"{label}: a literal entry carries its value and must not name a sopsFile"
+                )
+        elif value is not None:
+            problems.append(
+                f"{label}: 'value' is only valid on a source='literal' entry; "
+                "a SOPS-owned value belongs in its encrypted file, not in the manifest"
             )
 
         for field in ("groups", "hosts"):
@@ -254,6 +311,11 @@ def resolve_paths(
     resolved: list[dict[str, Any]] = []
     for entry in manifest:
         copied = dict(entry)
+        # A literal has no file to resolve, and handing it the fallback would
+        # make ``reconcile`` look like it might open one. Leave it untouched.
+        if entry_source(copied) == LITERAL_SOURCE:
+            resolved.append(copied)
+            continue
         raw = copied.get("sopsFile")
         candidate: Path | None
         if isinstance(raw, str) and raw.strip():

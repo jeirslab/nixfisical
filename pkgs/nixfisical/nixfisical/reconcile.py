@@ -18,6 +18,13 @@ usually a manifest-generation bug, and the dry run is where you find out.
 
 Nothing here prints a secret value. Dry-run output names coordinates only:
 project, environment, folder, secret name.
+
+Three kinds of entry reach step 5, told apart by ``source``. A ``sops`` entry
+is decrypted and pushed. An ``infisical`` entry is structure only -- its value
+is the instance's, and ``pull`` is the command that reads it. A ``literal``
+entry is pushed like a SOPS one but its value came in the manifest, so no file
+is opened: it is the port or the hostname beside the password, not the
+password.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from nixfisical.api import InfisicalClient, InfisicalError
-from nixfisical.manifest import entry_source
+from nixfisical.manifest import LITERAL_SOURCE, entry_source
 from nixfisical.sops import SopsError, read_key
 
 __all__ = ["Action", "ReconcileSummary", "reconcile", "folder_ancestors"]
@@ -338,6 +345,44 @@ def reconcile(
             summary.record(
                 "secret", target, "delegated", "source=infisical; run 'import' to pull it"
             )
+            continue
+
+        # A literal's value is already in hand -- it came in the manifest, and
+        # `validate` has already insisted it is a non-empty string. No SOPS
+        # file is opened, which is the whole point: this is the configuration
+        # that is not secret but that a rendered .env is useless without.
+        if entry_source(entry) == LITERAL_SOURCE:
+            project_id = resolve_project(entry)
+            if project_id is None:
+                summary.record(
+                    "secret",
+                    target,
+                    "would-upsert" if dry_run else "skipped",
+                    "project does not exist yet",
+                )
+                if dry_run:
+                    summary.secrets_planned += 1
+                continue
+            if dry_run:
+                summary.secrets_planned += 1
+                summary.record("secret", target, "would-upsert", "literal")
+                continue
+            try:
+                outcome = client.upsert_secret(
+                    str(entry["name"]),
+                    project_id=project_id,
+                    environment=str(entry["environment"]),
+                    secret_path=str(entry.get("folder") or "/"),
+                    value=str(entry["value"]),
+                )
+            except InfisicalError as exc:
+                summary.fail("secret", target, str(exc))
+                continue
+            if outcome == "created":
+                summary.secrets_created += 1
+            else:
+                summary.secrets_updated += 1
+            summary.record("secret", target, outcome, "literal")
             continue
 
         sops_file = entry.get("sopsFile")
