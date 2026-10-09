@@ -87,6 +87,7 @@ from nixfisical.agentconfig import (
     AgentConfigError,
     plan_templates,
     render_agent_config,
+    unmatched_filters,
     write_bundle,
 )
 from nixfisical.api import InfisicalClient, InfisicalError
@@ -1803,10 +1804,13 @@ def _parse_project_ids(flags: tuple[str, ...]) -> dict[str, str]:
 @cli.command("agent-config")
 @click.option(
     "--manifest",
-    "manifest_source",
-    default="-",
+    "manifest_sources",
+    multiple=True,
+    default=("-",),
     show_default=True,
-    help="Path to the JSON manifest, or '-' for stdin.",
+    help="Path to a JSON manifest, or '-' for stdin. Repeatable: the entries "
+    "of every manifest given are rendered together (a fleet manifest plus a "
+    "separate per-developer one, say).",
 )
 @click.option(
     "--out",
@@ -1847,6 +1851,23 @@ def _parse_project_ids(flags: tuple[str, ...]) -> dict[str, str]:
     "Default: every folder in the manifest.",
 )
 @click.option(
+    "--project",
+    "projects",
+    multiple=True,
+    metavar="NAME",
+    help="Render only this project's folders. Repeatable. Default: every "
+    "project. A name no manifest entry carries is an error, not an empty match.",
+)
+@click.option(
+    "--environment",
+    "environments",
+    multiple=True,
+    metavar="SLUG",
+    help="Render only this environment. Repeatable; combines with --project "
+    "(an entry must match both). Default: every environment. A slug no "
+    "manifest entry carries is an error.",
+)
+@click.option(
     "--polling-interval",
     default="60s",
     show_default=True,
@@ -1864,13 +1885,15 @@ def _parse_project_ids(flags: tuple[str, ...]) -> dict[str, str]:
 @click.pass_context
 def agent_config_command(
     ctx: click.Context,
-    manifest_source: str,
+    manifest_sources: tuple[str, ...],
     out: Path,
     install_root: str | None,
     dest_root: str,
     client_id_file: str,
     client_secret_file: str,
     groups: tuple[str, ...],
+    projects: tuple[str, ...],
+    environments: tuple[str, ...],
     polling_interval: str,
     project_id_flags: tuple[str, ...],
 ) -> None:
@@ -1883,11 +1906,16 @@ def agent_config_command(
     read by the agent at run time. Project ids are resolved against the
     instance as ``fleet-sync`` unless every one is pinned with --project-id.
     """
-    try:
-        manifest = load_manifest(manifest_source)
-    except ValueError as exc:
-        _fail(str(exc), EXIT_VALIDATION)
+    if list(manifest_sources).count("-") > 1:
+        _fail("--manifest '-' (stdin) can be given only once", EXIT_VALIDATION)
         return
+    manifest: list[dict] = []
+    for source in manifest_sources:
+        try:
+            manifest.extend(load_manifest(source))
+        except ValueError as exc:
+            _fail(str(exc), EXIT_VALIDATION)
+            return
 
     # `require_sops_file=False`: this reads coordinates only and never opens
     # a SOPS file, the same exemption `sync-access` has and for the same reason.
@@ -1898,11 +1926,38 @@ def agent_config_command(
             click.echo(f"  - {problem}", err=True)
         sys.exit(EXIT_VALIDATION)
 
-    specs = plan_templates(manifest, set(groups) or None)
+    project_filter = set(projects) or None
+    environment_filter = set(environments) or None
+    unmatched = unmatched_filters(
+        manifest, projects=project_filter, environments=environment_filter
+    )
+    if unmatched:
+        _fail(
+            "no manifest entry carries " + ", ".join(unmatched)
+            + " (a typo would otherwise drop it from the bundle silently)",
+            EXIT_VALIDATION,
+        )
+        return
+
+    specs = plan_templates(
+        manifest,
+        set(groups) or None,
+        projects=project_filter,
+        environments=environment_filter,
+    )
     if not specs:
+        narrowing = [
+            f"{label} {', '.join(values)}"
+            for label, values in (
+                ("groups", groups),
+                ("projects", projects),
+                ("environments", environments),
+            )
+            if values
+        ]
         _fail(
             "nothing to render: no manifest entry matches"
-            + (f" groups {', '.join(groups)}" if groups else ""),
+            + (f" {'; '.join(narrowing)}" if narrowing else ""),
             EXIT_VALIDATION,
         )
         return
