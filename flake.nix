@@ -388,6 +388,9 @@
       #     --group developers
       #
       # Every flag after `--` is `nixfisical agent-config`'s own; see its help.
+      # The app passes the evaluated manifest as `--manifest`; a `--manifest`
+      # given after `--` is ADDED to it (the option is repeatable), and
+      # `--project` / `--environment` narrow the union by coordinate.
       # The result is a directory -- agent.yaml, templates/, destinations.txt --
       # for the host's configuration management to copy into `--install-root`.
       # Nothing in it is a secret; see pkgs/nixfisical/nixfisical/agentconfig.py.

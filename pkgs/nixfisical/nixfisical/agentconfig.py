@@ -57,6 +57,7 @@ __all__ = [
     "dotenv_template",
     "plan_templates",
     "render_agent_config",
+    "unmatched_filters",
     "write_bundle",
 ]
 
@@ -141,12 +142,22 @@ def dotenv_template(
 def plan_templates(
     manifest: Iterable[dict[str, Any]],
     groups: set[str] | None = None,
+    *,
+    projects: set[str] | None = None,
+    environments: set[str] | None = None,
 ) -> list[TemplateSpec]:
     """Every distinct ``(project, environment, folder)`` the manifest exports.
 
     ``groups`` narrows it to folders that at least one entry exports to one of
     those groups -- the way to render a developers' bundle from a manifest
     that also carries operator-only folders. ``None`` means everything.
+
+    ``projects`` and ``environments`` narrow it by coordinate: an entry is
+    kept only when its project is in ``projects`` *and* its environment is in
+    ``environments`` (each ``None`` meaning "any"). That is the shape a
+    developer box wants when every entry exports to the same group, so
+    ``groups`` cannot tell production from staging: name the projects the
+    identity may read and the environments that are not production.
 
     Deliberately blind to ``source``: a folder is rendered whether its values
     came from SOPS, from the instance, or as literals, because the agent
@@ -159,6 +170,10 @@ def plan_templates(
         environment = entry.get("environment")
         if not project or not environment:
             continue
+        if projects is not None and project not in projects:
+            continue
+        if environments is not None and environment not in environments:
+            continue
         if groups is not None:
             declared = {g for g in (entry.get("groups") or []) if isinstance(g, str)}
             if not declared & groups:
@@ -166,6 +181,30 @@ def plan_templates(
         folder = str(entry.get("folder") or "/")
         specs.add(TemplateSpec(str(project), str(environment), folder))
     return sorted(specs, key=lambda s: (s.project, s.folder, s.environment))
+
+
+def unmatched_filters(
+    manifest: Iterable[dict[str, Any]],
+    *,
+    projects: set[str] | None = None,
+    environments: set[str] | None = None,
+) -> list[str]:
+    """Filter values that name nothing in the manifest, as ``--flag value``.
+
+    A ``--project`` spelled wrong does not fail on its own -- it silently
+    renders a bundle without that project, and the developer finds out when
+    an ``.env`` is missing. Checked against the whole manifest, not against
+    the other filter: ``--environment signet`` is not a typo because one of
+    the selected projects happens not to have signet.
+    """
+    entries = list(manifest)
+    seen_projects = {str(e.get("project")) for e in entries if e.get("project")}
+    seen_envs = {str(e.get("environment")) for e in entries if e.get("environment")}
+    missing = [f"--project {p}" for p in sorted((projects or set()) - seen_projects)]
+    missing += [
+        f"--environment {e}" for e in sorted((environments or set()) - seen_envs)
+    ]
+    return missing
 
 
 def render_agent_config(

@@ -1313,6 +1313,22 @@ unit, and every folder appears as
 home-manager module's `dotenv.enable` produces, from the same template text,
 so the two kinds of machine render the same file from the same declaration.
 
+`--group` cannot help when every entry exports to the same group. Narrow by
+coordinate instead: `--project NAME` and `--environment SLUG` are both
+repeatable, an entry must match both, and a value no entry carries is an error
+rather than a silently smaller bundle. `--manifest` is repeatable too, and the
+entries of every manifest given are rendered together — a fleet manifest plus
+a separate per-developer one, say:
+
+```sh
+nixfisical agent-config --manifest fleet.json --manifest developers.json \
+  --project backend-core --project developer-alice \
+  --environment dev --environment staging \
+  --out ./agent-bundle --install-root /etc/infisical-agent \
+  --client-id-file /etc/infisical-agent/client-id \
+  --client-secret-file /etc/infisical-agent/client-secret
+```
+
 Nothing in the bundle is a secret. The credentials are named by path and read
 by the agent at run time; `nixfisical provision-host` mints them and the host's
 own configuration management delivers the two files. The bundle can be

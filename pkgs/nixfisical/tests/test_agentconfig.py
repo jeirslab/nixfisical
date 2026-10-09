@@ -24,6 +24,7 @@ from nixfisical.agentconfig import (
     dotenv_template,
     plan_templates,
     render_agent_config,
+    unmatched_filters,
     write_bundle,
 )
 
@@ -91,6 +92,53 @@ def test_plan_can_be_narrowed_to_a_group() -> None:
         "/infrastructure/rabbitmq",
     }
     assert all(s.project == "master" for s in specs)
+
+
+FILTER_MANIFEST = [
+    entry("app", "dev", "/api", ["developers"]),
+    entry("app", "staging", "/api", ["developers"]),
+    entry("app", "prod", "/api", ["developers"]),
+    entry("infra", "dev", "/rabbitmq", ["developers"]),
+    entry("infra", "prod", "/rabbitmq", ["developers"]),
+    entry("ops", "dev", "/", ["operators"]),
+]
+
+
+def test_plan_can_be_narrowed_by_project_and_environment() -> None:
+    specs = plan_templates(
+        FILTER_MANIFEST, projects={"app", "infra"}, environments={"dev", "staging"}
+    )
+    assert [(s.project, s.environment) for s in specs] == [
+        ("app", "dev"),
+        ("app", "staging"),
+        ("infra", "dev"),
+    ]
+
+
+def test_project_and_environment_filters_are_independent() -> None:
+    assert {s.project for s in plan_templates(FILTER_MANIFEST, projects={"ops"})} == {
+        "ops"
+    }
+    assert {
+        s.environment for s in plan_templates(FILTER_MANIFEST, environments={"prod"})
+    } == {"prod"}
+
+
+def test_filters_combine_with_groups() -> None:
+    specs = plan_templates(FILTER_MANIFEST, {"developers"}, environments={"dev"})
+    assert {s.project for s in specs} == {"app", "infra"}
+
+
+def test_unmatched_filters_names_typos_only() -> None:
+    assert (
+        unmatched_filters(
+            FILTER_MANIFEST, projects={"app", "ap"}, environments={"dev", "signet"}
+        )
+        == ["--project ap", "--environment signet"]
+    )
+    # An environment one selected project lacks is not a typo.
+    assert unmatched_filters(FILTER_MANIFEST, projects={"ops"}, environments={"prod"}) == []
+    assert unmatched_filters(FILTER_MANIFEST) == []
 
 
 def test_plan_ignores_entries_with_no_coordinate() -> None:
@@ -197,3 +245,93 @@ def test_a_bundle_contains_no_credential_material(tmp_path: Path) -> None:
     # no way to read them, and this pins that it is not handed them either.
     assert "/etc/infisical-agent/client-secret" in everything
     assert "secretValue" not in everything
+
+
+# -- the command ---------------------------------------------------------------
+
+
+def _write(path: Path, entries: list[dict]) -> str:
+    import json
+
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    return str(path)
+
+
+def _run_agent_config(tmp_path: Path, *args: str):
+    from click.testing import CliRunner
+
+    from nixfisical.cli import cli
+
+    return CliRunner().invoke(
+        cli,
+        [
+            "--url",
+            "https://infisical.example.org",
+            "agent-config",
+            "--out",
+            str(tmp_path / "out"),
+            "--install-root",
+            "/etc/infisical-agent",
+            "--client-id-file",
+            "/etc/infisical-agent/client-id",
+            "--client-secret-file",
+            "/etc/infisical-agent/client-secret",
+            "--project-id",
+            "app=id-app",
+            "--project-id",
+            "infra=id-infra",
+            "--project-id",
+            "ops=id-ops",
+            "--project-id",
+            "developer-alice=id-alice",
+            *args,
+        ],
+    )
+
+
+def _literal(project: str, environment: str, folder: str) -> dict:
+    e = entry(project, environment, folder, ["developers"])
+    e.update(source="literal", value="v")
+    return e
+
+
+def test_cli_unions_manifests_and_filters(tmp_path: Path) -> None:
+    fleet = _write(
+        tmp_path / "fleet.json",
+        [
+            _literal("app", "dev", "/api"),
+            _literal("app", "prod", "/api"),
+            _literal("ops", "dev", "/"),
+        ],
+    )
+    devs = _write(
+        tmp_path / "devs.json",
+        [_literal("developer-alice", "dev", "/"), _literal("developer-bob", "dev", "/")],
+    )
+    result = _run_agent_config(
+        tmp_path,
+        "--manifest", fleet,
+        "--manifest", devs,
+        "--project", "app",
+        "--project", "developer-alice",
+        "--environment", "dev",
+    )
+    assert result.exit_code == 0, result.output
+    names = sorted(p.name for p in (tmp_path / "out" / "templates").iterdir())
+    assert names == ["app__api__dev.tmpl", "developer-alice__root__dev.tmpl"]
+
+
+def test_cli_refuses_a_filter_that_matches_nothing(tmp_path: Path) -> None:
+    fleet = _write(tmp_path / "fleet.json", [_literal("app", "dev", "/api")])
+    result = _run_agent_config(
+        tmp_path, "--manifest", fleet, "--project", "apps", "--environment", "dev"
+    )
+    assert result.exit_code != 0
+    assert "--project apps" in result.output
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_refuses_stdin_twice(tmp_path: Path) -> None:
+    result = _run_agent_config(tmp_path, "--manifest", "-", "--manifest", "-")
+    assert result.exit_code != 0
+    assert "only once" in result.output
